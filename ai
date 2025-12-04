@@ -1,0 +1,1103 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>할 일 목록 및 캘린더</title>
+    <!-- Tailwind CSS CDN 로드 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter 폰트 설정 -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <div id="app" class="min-h-screen p-4 sm:p-8">
+        <!-- 애플리케이션이 렌더링될 곳 -->
+        <div class="text-center py-12 text-lg text-indigo-500">
+            <svg class="animate-spin inline-block w-6 h-6 mr-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            데이터 로딩 중...
+        </div>
+    </div>
+
+    <!-- Firebase Script Modules -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, onSnapshot, collection, query, where, updateDoc, deleteDoc, getDocs, Timestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // setLogLevel('Debug'); // 디버그 로그 활성화
+
+        // --- 전역 변수 설정 (Canvas 환경에서 제공) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // --- Firebase 인스턴스 ---
+        let app, db, auth;
+
+        // --- UI 요소 선택 ---
+        const appElement = document.getElementById('app');
+
+        // --- 상태 관리 ---
+        const todayStr = new Date().toISOString().split('T')[0];
+        const initialTaskState = {
+            taskName: '',
+            startDate: todayStr,
+            endDate: todayStr,
+            startTime: '09:00', // NEW: 시작 시간
+            endTime: '18:00',   // NEW: 종료 시간
+            priority: '중간',
+            importance: '중간',
+            category: '업무',
+            completed: false,
+        };
+        const DEFAULT_CATEGORY_OPTIONS = ['업무', '개인', '학습', '기타'];
+        
+        const state = {
+            isAuthReady: false,
+            userId: null,
+            tasks: [],
+            customCategories: DEFAULT_CATEGORY_OPTIONS,
+            currentMonth: new Date(),
+            selectedDateTasks: [],
+            activeTab: 'list', // 'list', 'calendar', 'categories'
+            listFilter: 'active', // 'active', 'completed'
+            
+            // 정렬 및 필터링 상태 (요청 사항)
+            sortField: 'createdAt', // 'createdAt', 'startDate', 'endDate'
+            sortOrder: 'desc', // 'asc', 'desc'
+            filterDateType: 'none', // 'startDate', 'endDate', 'createdAt', 'none'
+            filterStartDate: '',
+            filterEndDate: '',
+            
+            isModalOpen: false,
+            editingTask: null, // task ID
+            newTask: { ...initialTaskState },
+            
+            // 캘린더 계산용
+            taskMap: new Map(),
+        };
+
+        // --- 헬퍼 함수 ---
+        const setState = (updates) => {
+            Object.assign(state, updates);
+            renderApp();
+        };
+
+        const formatDate = (date) => {
+            if (date instanceof Date) {
+                return date.toISOString().split('T')[0];
+            }
+            return date; // 이미 문자열인 경우
+        };
+        
+        // 날짜와 시간을 결합하여 비교 가능한 문자열을 생성
+        const getDateTimeString = (dateStr, timeStr) => `${dateStr} ${timeStr || '00:00'}`;
+
+        const importanceColors = {
+            '낮음': 'bg-green-100 text-green-800 border-green-300',
+            '중간': 'bg-yellow-100 text-yellow-800 border-yellow-300',
+            '높음': 'bg-red-100 text-red-800 border-red-300',
+        };
+        const priorityColors = {
+            '낮음': 'text-green-600',
+            '중간': 'text-yellow-600',
+            '높음': 'text-red-600',
+        };
+
+        // --- Firebase 초기화 및 인증 ---
+        async function initFirebase() {
+            try {
+                if (Object.keys(firebaseConfig).length > 0) {
+                    app = initializeApp(firebaseConfig);
+                    db = getFirestore(app);
+                    auth = getAuth(app);
+                } else {
+                    console.error("Firebase configuration is missing.");
+                    return;
+                }
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (!user) {
+                        try {
+                            if (initialAuthToken) {
+                                await signInWithCustomToken(auth, initialAuthToken);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        } catch (error) {
+                            console.error("Sign-in failed:", error);
+                            await signInAnonymously(auth);
+                        }
+                    } else {
+                        setState({ userId: user.uid, isAuthReady: true });
+                        console.log("Firebase Auth Ready. User ID:", user.uid);
+                        setupFirestoreListeners();
+                    }
+                });
+            } catch (e) {
+                console.error("Firebase initialization failed:", e);
+            }
+        }
+
+        // --- Firestore 데이터 리스너 설정 ---
+        function setupFirestoreListeners() {
+            if (!state.isAuthReady || !state.userId) return;
+
+            // 1. Tasks Listener
+            const taskCollectionPath = `artifacts/${appId}/users/${state.userId}/tasks`;
+            onSnapshot(collection(db, taskCollectionPath), (snapshot) => {
+                const fetchedTasks = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    // Firestore Timestamp를 JS Date 객체로 변환
+                    createdAt: doc.data().createdAt instanceof Timestamp ? doc.data().createdAt.toDate() : new Date(), 
+                    ...doc.data(),
+                }));
+                setState({ tasks: fetchedTasks });
+                updateTaskMap();
+            }, (error) => {
+                console.error("Error fetching tasks:", error);
+            });
+            
+            // 2. Categories Listener
+            const categoryCollectionPath = `artifacts/${appId}/users/${state.userId}/categories`;
+            onSnapshot(collection(db, categoryCollectionPath), (snapshot) => {
+                const fetchedCategories = snapshot.docs.map(doc => doc.data().name);
+                const uniqueCategories = [...new Set([...DEFAULT_CATEGORY_OPTIONS, ...fetchedCategories])].filter(name => name);
+                setState({ customCategories: uniqueCategories });
+            }, (error) => {
+                console.error("Error fetching categories:", error);
+            });
+        }
+        
+        // --- 캘린더 Task Map 업데이트 ---
+        function updateTaskMap() {
+            const map = new Map();
+            state.tasks.filter(t => !t.completed).forEach(task => {
+                let currentDate = new Date(task.startDate);
+                const endDate = new Date(task.endDate);
+                
+                while (currentDate <= endDate) {
+                    const dateStr = formatDate(currentDate);
+                    if (!map.has(dateStr)) {
+                        map.set(dateStr, []);
+                    }
+                    map.get(dateStr).push(task);
+                    currentDate.setDate(currentDate.getDate() + 1);
+                }
+            });
+            setState({ taskMap: map });
+        }
+
+        // --- CRUD 및 이벤트 핸들러 ---
+        
+        window.handleInputChange = (e) => {
+            const { name, value, type, checked } = e.target;
+            const newValue = type === 'checkbox' ? checked : value;
+            setState({ newTask: { ...state.newTask, [name]: newValue } });
+        };
+        
+        window.handleSortChange = (e) => {
+            const [field, order] = e.target.value.split('_');
+            setState({ sortField: field, sortOrder: order });
+        };
+
+        window.handleFilterDateTypeChange = (e) => {
+            setState({ 
+                filterDateType: e.target.value,
+                filterStartDate: '', // 기준 변경 시 날짜 초기화
+                filterEndDate: '',
+            });
+        };
+        
+        window.handleFilterDateChange = (type, value) => {
+            if (type === 'start') {
+                setState({ filterStartDate: value });
+            } else {
+                setState({ filterEndDate: value });
+            }
+        };
+
+
+        window.handleSubmitTask = async (e) => {
+            e.preventDefault();
+            const task = state.newTask;
+            
+            if (!state.userId) {
+                console.error("User not authenticated.");
+                return;
+            }
+
+            if (!task.taskName || !task.startDate || !task.endDate || !task.startTime || !task.endTime) {
+                alert("업무명, 시작일, 종료일, 시간은 필수 입력 사항입니다.");
+                return;
+            }
+            
+            // 날짜/시간 유효성 검사
+            const startDateTime = getDateTimeString(task.startDate, task.startTime);
+            const endDateTime = getDateTimeString(task.endDate, task.endTime);
+            
+            if (startDateTime > endDateTime) {
+                alert("시작 일시는 종료 일시보다 빠르거나 같아야 합니다.");
+                return;
+            }
+
+            try {
+                const taskCollectionPath = `artifacts/${appId}/users/${state.userId}/tasks`;
+                
+                if (state.editingTask) {
+                    // UPDATE
+                    const taskRef = doc(db, taskCollectionPath, state.editingTask);
+                    const { id, createdAt, ...updatePayload } = task; // ID와 createdAt 제외
+                    
+                    await updateDoc(taskRef, updatePayload);
+                    console.log("Task updated successfully.");
+                } else {
+                    // ADD
+                    await addDoc(collection(db, taskCollectionPath), {
+                        ...task,
+                        createdAt: new Date(), // 생성 시간 기록
+                    });
+                    console.log("Task added successfully.");
+                }
+
+                closeModal();
+                
+            } catch (e) {
+                console.error("Error saving document: ", e);
+            }
+        };
+        
+        window.handleToggleCompletion = async (taskId, currentCompletedStatus) => {
+            if (!state.userId) return;
+            try {
+                const taskCollectionPath = `artifacts/${appId}/users/${state.userId}/tasks`;
+                const taskRef = doc(db, taskCollectionPath, taskId);
+                await updateDoc(taskRef, {
+                    completed: !currentCompletedStatus,
+                    completedAt: !currentCompletedStatus ? new Date() : null,
+                });
+            } catch (e) {
+                console.error("Error toggling completion:", e);
+            }
+        };
+
+        window.openAddModal = () => {
+            setState({ 
+                editingTask: null, 
+                newTask: { ...initialTaskState }, 
+                isModalOpen: true 
+            });
+        };
+
+        window.openEditModal = (task) => {
+            setState({
+                editingTask: task.id,
+                newTask: {
+                    taskName: task.taskName,
+                    startDate: task.startDate,
+                    endDate: task.endDate,
+                    startTime: task.startTime || '09:00', 
+                    endTime: task.endTime || '18:00',     
+                    priority: task.priority,
+                    importance: task.importance,
+                    category: task.category,
+                    completed: task.completed,
+                },
+                isModalOpen: true
+            });
+        };
+        
+        window.closeModal = () => {
+            setState({ 
+                isModalOpen: false, 
+                editingTask: null 
+            });
+        };
+        
+        window.setActiveTab = (tab) => {
+            setState({ activeTab: tab });
+        };
+
+        // --- 캘린더 관련 함수 ---
+        window.changeMonth = (delta) => {
+            const prev = state.currentMonth;
+            const newMonth = new Date(prev.getFullYear(), prev.getMonth() + delta, 1);
+            setState({ currentMonth: newMonth, selectedDateTasks: [] });
+        };
+        
+        window.handleDayClick = (dateStr) => {
+            const tasksOnDay = state.taskMap.get(dateStr) || [];
+            setState({ selectedDateTasks: tasksOnDay, activeTab: 'calendar' });
+        };
+        
+        // --- 분류 관리 함수 (CategoryManager) ---
+        window.handleAddCategory = async (inputElement) => {
+            const newCategoryName = inputElement.value.trim();
+            if (!newCategoryName || !state.userId) return;
+            
+            if (state.customCategories.includes(newCategoryName)) {
+                alert("이미 존재하는 분류입니다."); 
+                return;
+            }
+            
+            try {
+                const categoryCollectionPath = `artifacts/${appId}/users/${state.userId}/categories`;
+                await addDoc(collection(db, categoryCollectionPath), {
+                    name: newCategoryName,
+                    createdAt: new Date(),
+                });
+                inputElement.value = '';
+            } catch (e) {
+                console.error("Error adding category:", e);
+            }
+        };
+
+        window.handleDeleteCategory = async (categoryName) => {
+            if (!state.userId || DEFAULT_CATEGORY_OPTIONS.includes(categoryName)) {
+                alert("기본 분류는 삭제할 수 없습니다.");
+                return;
+            }
+            
+            // 사용자 정의 모달 대신 간단한 window.confirm 사용 (Canvas 가이드라인 준수)
+            if (!confirm(`분류 '${categoryName}'을(를) 삭제하시겠습니까? 이 분류에 속한 업무는 '기타'로 변경됩니다.`)) {
+                return;
+            }
+
+            try {
+                const categoryCollectionPath = `artifacts/${appId}/users/${state.userId}/categories`;
+                const taskCollectionPath = `artifacts/${appId}/users/${state.userId}/tasks`;
+                
+                // 1. 해당 카테고리 Firestore 문서 삭제
+                const qCategory = query(collection(db, categoryCollectionPath), where('name', '==', categoryName));
+                const snapshotCategory = await getDocs(qCategory);
+                snapshotCategory.forEach(async (doc) => {
+                    await deleteDoc(doc.ref);
+                });
+                
+                // 2. 해당 카테고리를 사용하던 업무들을 '기타'로 업데이트
+                const qTasks = query(collection(db, taskCollectionPath), where('category', '==', categoryName));
+                const snapshotTasks = await getDocs(qTasks);
+
+                snapshotTasks.forEach(async (doc) => {
+                    await updateDoc(doc.ref, { category: '기타' });
+                });
+                
+                console.log(`Category ${categoryName} and related tasks updated.`);
+                
+            } catch (e) {
+                console.error("Error deleting category:", e);
+            }
+        };
+        
+        // --- 렌더링 함수 ---
+        
+        function renderHeader() {
+            return `
+                <header class="mb-8 flex flex-col sm:flex-row justify-between items-start sm:items-center">
+                    <h1 class="text-3xl font-extrabold text-gray-900 flex items-center mb-4 sm:mb-0">
+                        <svg class="w-8 h-8 mr-3 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        오늘 할 업무 관리
+                    </h1>
+                    <div class="flex items-center space-x-4">
+                        <span class="text-sm text-gray-500">
+                            사용자 ID: ${state.userId || '인증 대기 중...'}
+                        </span>
+                        <button
+                            onclick="openAddModal()"
+                            class="flex items-center px-4 py-2 bg-indigo-600 text-white font-medium rounded-full shadow-lg hover:bg-indigo-700 transition duration-150 transform hover:scale-105"
+                            ${!state.isAuthReady ? 'disabled' : ''}
+                        >
+                            <svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                            업무 추가
+                        </button>
+                    </div>
+                </header>
+            `;
+        }
+
+        function renderStats() {
+            const activeTasks = state.tasks.filter(t => !t.completed);
+            const totalRemaining = activeTasks.length;
+
+            const todayTasks = activeTasks.filter(task => {
+                return task.startDate <= todayStr && todayStr <= task.endDate;
+            });
+            const todayTaskCount = todayTasks.length;
+
+            const importantTaskCount = activeTasks.filter(task => task.importance === '높음').length;
+
+            const categoryCounts = {};
+            activeTasks.forEach(task => {
+                const categoryName = state.customCategories.includes(task.category) ? task.category : '기타';
+                categoryCounts[categoryName] = (categoryCounts[categoryName] || 0) + 1;
+            });
+            
+            const StatCard = ({ title, value, icon, color }) => `
+                <div class="p-5 rounded-xl shadow-lg border border-${color}-200 bg-white text-gray-800 flex items-center justify-between transition duration-300 hover:shadow-xl">
+                    <div>
+                        <p class="text-sm font-medium">${title}</p>
+                        <p class="text-3xl font-bold mt-1">${value}</p>
+                    </div>
+                    <svg class="w-8 h-8 opacity-70 text-${color}-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">${icon}</svg>
+                </div>
+            `;
+            
+            return `
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                    ${StatCard({ 
+                        title: "남은 업무 수", value: totalRemaining, color: 'indigo',
+                        icon: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16m-7 6h7"></path>' // List
+                    })}
+                    ${StatCard({ 
+                        title: "오늘 할 업무", value: todayTaskCount, color: 'yellow',
+                        icon: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>' // Clock
+                    })}
+                    ${StatCard({ 
+                        title: "중요 업무", value: importantTaskCount, color: 'red',
+                        icon: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>' // AlertTriangle
+                    })}
+                </div>
+                
+                <div class="bg-white p-6 rounded-xl shadow-lg mb-8">
+                    <h3 class="text-xl font-bold text-gray-800 mb-4 flex items-center">
+                        <svg class="w-5 h-5 mr-2 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"></path></svg>
+                        업무 분류별 현황 (미완료)
+                    </h3>
+                    <div class="flex flex-wrap gap-4">
+                        ${state.customCategories.length > 0 ? (
+                            state.customCategories.map(category => `
+                                <div class="p-3 border border-indigo-200 rounded-lg flex-grow min-w-[150px] shadow-sm bg-indigo-50">
+                                    <p class="text-sm font-medium text-gray-700">${category}</p>
+                                    <p class="text-2xl font-bold text-indigo-700 mt-1">
+                                        ${categoryCounts[category] || 0} 개
+                                    </p>
+                                </div>
+                            `).join('')
+                        ) : (
+                            '<p class="text-gray-500 text-sm">업무 분류 데이터가 없습니다.</p>'
+                        )}
+                    </div>
+                </div>
+            `;
+        }
+        
+        function renderTaskCard(task) {
+            const baseClass = task.completed 
+                ? 'bg-gray-50 border-gray-200 opacity-60' 
+                : `shadow-md hover:shadow-lg ${importanceColors[task.importance].split(' ')[0].replace('bg', 'bg-opacity')}`;
+            
+            return `
+                <div class="p-4 mb-3 rounded-xl border transition duration-300 ${baseClass}">
+                    <div class="flex items-start justify-between">
+                        <div class="flex items-center space-x-3 w-full">
+                            <!-- 체크박스 -->
+                            <input
+                                type="checkbox"
+                                ${task.completed ? 'checked' : ''}
+                                onchange="handleToggleCompletion('${task.id}', ${task.completed})"
+                                class="w-5 h-5 text-indigo-600 bg-gray-100 border-gray-300 rounded focus:ring-indigo-500 cursor-pointer flex-shrink-0"
+                            />
+                            <!-- 업무명 -->
+                            <div class="flex-grow">
+                                <p class="font-semibold text-gray-800 ${task.completed ? 'line-through text-gray-500' : ''}">
+                                    ${task.taskName}
+                                </p>
+                                <div class="flex flex-wrap items-center text-xs mt-1 text-gray-500">
+                                    <!-- Clock Icon -->
+                                    <svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                    <!-- 시간 정보 포함하여 표시 -->
+                                    <span>
+                                        ${task.startDate} ${task.startTime} ~ ${task.endDate} ${task.endTime}
+                                    </span>
+                                    <span class="mx-2">•</span>
+                                    <span class="font-medium ${priorityColors[task.priority]}">
+                                        <!-- AlertTriangle Icon -->
+                                        <svg class="w-3 h-3 inline mr-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                        우선순위: ${task.priority}
+                                    </span>
+                                    <!-- 추가된 날짜 -->
+                                    <span class="mx-2">•</span>
+                                    <span class="text-gray-500">
+                                        추가: ${task.createdAt ? formatDate(task.createdAt) : 'N/A'}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                        <!-- 수정 버튼 -->
+                        <button 
+                            onclick="openEditModal(${JSON.stringify(task).replace(/"/g, '&quot;')})"
+                            class="text-gray-500 hover:text-indigo-700 p-1 rounded-full hover:bg-indigo-50 transition duration-150 flex-shrink-0 ${task.completed ? 'opacity-50 cursor-not-allowed' : ''}"
+                            title="업무 수정"
+                            ${task.completed ? 'disabled' : ''}
+                        >
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>
+                        </button>
+                    </div>
+                    
+                    <!-- 상세 정보 뱃지 -->
+                    <div class="flex flex-wrap gap-2 mt-3 pt-3 border-t border-gray-100">
+                        <span class="text-xs font-medium px-2.5 py-0.5 rounded-full border ${importanceColors[task.importance]}">
+                            중요도: ${task.importance}
+                        </span>
+                        <span class="text-xs font-medium px-2.5 py-0.5 rounded-full bg-indigo-100 text-indigo-800 border border-indigo-300">
+                            분류: ${task.category}
+                        </span>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderTaskList() {
+            const allTasks = state.tasks;
+            let list = state.listFilter === 'active' 
+                ? allTasks.filter(t => !t.completed) 
+                : allTasks.filter(t => t.completed);
+
+            // 1. Filtering by Date Range
+            if (state.filterDateType !== 'none' && state.filterStartDate && state.filterEndDate) {
+                list = list.filter(task => {
+                    let taskDateStr;
+                    if (state.filterDateType === 'startDate') taskDateStr = task.startDate;
+                    else if (state.filterDateType === 'endDate') taskDateStr = task.endDate;
+                    else if (state.filterDateType === 'createdAt') taskDateStr = formatDate(task.createdAt); 
+
+                    if (!taskDateStr) return false;
+
+                    return taskDateStr >= state.filterStartDate && taskDateStr <= state.filterEndDate;
+                });
+            }
+
+            // 2. Sorting
+            list.sort((a, b) => {
+                let valA, valB;
+                
+                if (state.sortField === 'createdAt') {
+                    // Date 객체의 getTime()으로 비교
+                    valA = a.createdAt.getTime();
+                    valB = b.createdAt.getTime();
+                } else if (state.sortField === 'startDate') {
+                    // 시작 날짜와 시간 결합 ("YYYY-MM-DD HH:MM")
+                    valA = getDateTimeString(a.startDate, a.startTime);
+                    valB = getDateTimeString(b.startDate, b.startTime);
+                } else if (state.sortField === 'endDate') {
+                    // 종료 날짜와 시간 결합 ("YYYY-MM-DD HH:MM")
+                    valA = getDateTimeString(a.endDate, a.endTime);
+                    valB = getDateTimeString(b.endDate, b.endTime);
+                } else {
+                    return 0;
+                }
+
+                let comparison = 0;
+                if (typeof valA === 'string' && typeof valB === 'string') {
+                    comparison = valA.localeCompare(valB);
+                } else {
+                    if (valA < valB) comparison = -1;
+                    if (valA > valB) comparison = 1;
+                }
+
+                return state.sortOrder === 'asc' ? comparison : -comparison;
+            });
+            
+            const sortValue = `${state.sortField}_${state.sortOrder}`;
+            const isFilterDisabled = state.filterDateType === 'none';
+
+            return `
+                <div class="bg-white p-6 rounded-xl shadow-lg">
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 border-b pb-4">
+                        <h2 class="text-2xl font-bold text-gray-800 flex items-center mb-4 sm:mb-0">
+                            <svg class="w-6 h-6 mr-2 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16m-7 6h7"></path></svg>
+                            ${state.listFilter === 'active' ? '활성 업무 목록' : '완료된 업무 목록'} (${list.length}개)
+                        </h2>
+                        
+                        <!-- 필터 탭 -->
+                        <div class="flex space-x-2 p-1 bg-gray-100 rounded-lg">
+                            <button
+                                onclick="setState({ listFilter: 'active' })"
+                                class="px-3 py-1 text-sm font-medium rounded-md transition duration-200 ${
+                                    state.listFilter === 'active' ? 'bg-indigo-600 text-white shadow' : 'text-gray-600 hover:bg-gray-200'
+                                }"
+                            >
+                                미완료 업무
+                            </button>
+                            <button
+                                onclick="setState({ listFilter: 'completed' })"
+                                class="px-3 py-1 text-sm font-medium rounded-md transition duration-200 ${
+                                    state.listFilter === 'completed' ? 'bg-indigo-600 text-white shadow' : 'text-gray-600 hover:bg-gray-200'
+                                }"
+                            >
+                                완료된 업무 보기
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- 정렬 및 필터링 컨트롤 -->
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                        
+                        <!-- 정렬 기준 -->
+                        <div class="col-span-1">
+                            <label class="block text-sm font-medium text-gray-700 mb-1">정렬 기준</label>
+                            <select
+                                value="${sortValue}"
+                                onchange="handleSortChange(event)"
+                                class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                            >
+                                <option value="createdAt_desc">추가된 날짜 (최신순)</option>
+                                <option value="createdAt_asc">추가된 날짜 (오래된순)</option>
+                                <option value="startDate_asc">시작 일시 (빠른순)</option>
+                                <option value="startDate_desc">시작 일시 (늦은순)</option>
+                                <option value="endDate_asc">종료 일시 (빠른순)</option>
+                                <option value="endDate_desc">종료 일시 (늦은순)</option>
+                            </select>
+                        </div>
+
+                        <!-- 필터링 기준 -->
+                        <div class="col-span-1">
+                            <label class="block text-sm font-medium text-gray-700 mb-1">필터링 기준</label>
+                            <select
+                                value="${state.filterDateType}"
+                                onchange="handleFilterDateTypeChange(event)"
+                                class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                            >
+                                <option value="none">필터링 안 함</option>
+                                <option value="createdAt">추가된 날짜</option>
+                                <option value="startDate">시작일</option>
+                                <option value="endDate">종료일</option>
+                            </select>
+                        </div>
+                        
+                        <!-- 필터 날짜 입력 -->
+                        <div class="col-span-2 flex space-x-2">
+                            <div class="flex-1">
+                                <label class="block text-sm font-medium text-gray-700 mb-1">시작 날짜</label>
+                                <input
+                                    type="date"
+                                    value="${state.filterStartDate}"
+                                    onchange="handleFilterDateChange('start', event.target.value)"
+                                    ${isFilterDisabled ? 'disabled' : ''}
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 disabled:bg-gray-100"
+                                />
+                            </div>
+                            <div class="flex-1">
+                                <label class="block text-sm font-medium text-gray-700 mb-1">종료 날짜</label>
+                                <input
+                                    type="date"
+                                    value="${state.filterEndDate}"
+                                    onchange="handleFilterDateChange('end', event.target.value)"
+                                    ${isFilterDisabled ? 'disabled' : ''}
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 disabled:bg-gray-100"
+                                />
+                            </div>
+                        </div>
+                    </div>
+
+                    ${list.length > 0 ? (
+                        `<div class="space-y-4">` + list.map(task => renderTaskCard(task)).join('') + `</div>`
+                    ) : (
+                        `<p class="text-gray-500 text-center py-10">
+                            ${state.listFilter === 'active' ? '남은 업무가 없습니다. 새로운 업무를 추가해보세요!' : '완료된 업무가 없습니다.'}
+                        </p>`
+                    )}
+                </div>
+            `;
+        }
+
+        function renderCalendar() {
+            const date = state.currentMonth;
+            const year = date.getFullYear();
+            const month = date.getMonth();
+
+            const startOfMonth = new Date(year, month, 1);
+            const endOfMonth = new Date(year, month + 1, 0);
+            
+            const startOfWeek = (d) => {
+                const day = d.getDay(); 
+                const diff = d.getDate() - day; 
+                return new Date(d.setDate(diff));
+            };
+
+            const start = startOfWeek(startOfMonth);
+            const end = startOfWeek(new Date(endOfMonth.getFullYear(), endOfMonth.getMonth(), endOfMonth.getDate() + (6 - endOfMonth.getDay())));
+
+            const days = [];
+            let day = start;
+            let limit = 42; 
+            
+            while (day <= end && limit > 0) {
+                days.push(new Date(day));
+                day.setDate(day.getDate() + 1);
+                limit--;
+            }
+
+            const renderDay = (date) => {
+                const dateStr = formatDate(date);
+                const isCurrentMonth = date.getMonth() === month;
+                const isToday = dateStr === todayStr;
+                const tasksOnDay = state.taskMap.get(dateStr) || [];
+                
+                return `
+                    <div 
+                        onclick="handleDayClick('${dateStr}')"
+                        class="p-1 h-20 flex flex-col items-center justify-start rounded-lg transition duration-200 cursor-pointer 
+                        ${isCurrentMonth ? 'text-gray-800 hover:bg-indigo-50' : 'text-gray-400 bg-gray-50'}
+                        ${isToday ? 'border-2 border-indigo-500 bg-indigo-50 font-bold' : 'border border-gray-100'}
+                        ${date.getDay() === 0 ? 'text-red-500' : date.getDay() === 6 ? 'text-blue-500' : ''}
+                    ">
+                        <div class="text-sm ${isToday ? 'text-indigo-700' : ''}">${date.getDate()}</div>
+                        ${tasksOnDay.length > 0 ? `
+                            <div class="mt-1 text-xs px-2 py-0.5 rounded-full bg-indigo-500 text-white font-medium">
+                                ${tasksOnDay.length}개 업무
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            };
+
+            const renderSelectedTasks = () => {
+                if (state.selectedDateTasks.length === 0) return '';
+                
+                const selectedDate = state.selectedDateTasks[0].startDate;
+
+                return `
+                    <div class="mt-8 pt-4 border-t border-gray-200">
+                        <h3 class="text-xl font-bold mb-4 flex items-center text-indigo-700">
+                            <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            ${selectedDate}의 업무
+                        </h3>
+                        <div class="space-y-3 max-h-60 overflow-y-auto pr-2">
+                            ${state.selectedDateTasks.map(task => `
+                                <div class="p-3 bg-gray-50 rounded-lg border border-gray-200 text-sm flex justify-between items-center">
+                                    <span class="font-medium ${task.completed ? 'line-through text-gray-500' : 'text-gray-800'}">${task.taskName}</span>
+                                    <span class="text-xs px-2 py-0.5 rounded-full ${importanceColors[task.importance]}">
+                                        ${task.importance}
+                                    </span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            };
+
+            return `
+                <div class="bg-white p-6 rounded-xl shadow-lg">
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold text-gray-800 flex items-center">
+                            <svg class="w-6 h-6 mr-2 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-4 4V3m4 8H8m4-4h.01M12 21V11M3 8h18"></path></svg>
+                            업무 캘린더
+                        </h2>
+                        <div class="flex items-center space-x-4">
+                            <button onclick="changeMonth(-1)" class="p-2 rounded-full hover:bg-gray-100 transition">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
+                            </button>
+                            <span class="text-xl font-semibold">
+                                ${year}년 ${month + 1}월
+                            </span>
+                            <button onclick="changeMonth(1)" class="p-2 rounded-full hover:bg-gray-100 transition">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-7 text-center font-medium text-sm text-gray-500 border-b pb-2">
+                        ${['일', '월', '화', '수', '목', '금', '토'].map(day => `
+                            <div class="${day === '일' ? 'text-red-500' : day === '토' ? 'text-blue-500' : ''}">${day}</div>
+                        `).join('')}
+                    </div>
+
+                    <div class="grid grid-cols-7 auto-rows-fr gap-1 mt-2">
+                        ${days.map(renderDay).join('')}
+                    </div>
+                    
+                    ${renderSelectedTasks()}
+                </div>
+            `;
+        }
+        
+        function renderCategoryManager() {
+            return `
+                <div class="bg-white p-6 rounded-xl shadow-lg">
+                    <h2 class="text-2xl font-bold text-gray-800 mb-4 flex items-center border-b pb-4">
+                        <svg class="w-6 h-6 mr-2 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37a1.724 1.724 0 002.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                        업무 분류 관리
+                    </h2>
+                    
+                    <div class="mb-6">
+                        <div class="flex space-x-2">
+                            <input
+                                type="text"
+                                id="newCategoryName"
+                                placeholder="새 분류 이름 입력"
+                                class="flex-grow px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                            />
+                            <button
+                                onclick="handleAddCategory(document.getElementById('newCategoryName'))"
+                                class="px-4 py-2 bg-indigo-600 text-white font-medium rounded-md shadow-sm hover:bg-indigo-700 transition"
+                            >
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <h3 class="text-lg font-semibold text-gray-700 mb-3">현재 분류 목록</h3>
+                    <div class="flex flex-wrap gap-2">
+                        ${state.customCategories.map(category => `
+                            <div 
+                                class="flex items-center space-x-1 px-3 py-1 text-sm font-medium rounded-full border 
+                                    ${DEFAULT_CATEGORY_OPTIONS.includes(category) ? 'bg-gray-100 text-gray-700 border-gray-300' : 'bg-indigo-100 text-indigo-800 border-indigo-300'}
+                                "
+                            >
+                                <span>${category}</span>
+                                ${!DEFAULT_CATEGORY_OPTIONS.includes(category) ? `
+                                    <button 
+                                        onclick="handleDeleteCategory('${category}')"
+                                        class="text-red-500 hover:text-red-700 p-0.5 rounded-full hover:bg-white transition"
+                                        title="분류 삭제"
+                                    >
+                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                    </button>
+                                ` : ''}
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+        
+        function renderModal() {
+            if (!state.isModalOpen) return '';
+            const task = state.newTask;
+            const isEditing = state.editingTask !== null;
+
+            return `
+                <div id="taskModal" class="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50">
+                    <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg m-4 transform transition-all duration-300 scale-100">
+                        <div class="p-6 border-b flex justify-between items-center">
+                            <h3 class="text-xl font-bold text-gray-800">
+                                ${isEditing ? '업무 수정' : '새로운 업무 추가'}
+                            </h3>
+                            <button onclick="closeModal()" class="text-gray-400 hover:text-gray-600 transition">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                            </button>
+                        </div>
+                        <form onsubmit="handleSubmitTask(event)" class="p-6 space-y-4">
+                            <div class="space-y-2">
+                                <label for="taskName" class="block text-sm font-medium text-gray-700">업무명 (필수)</label>
+                                <input
+                                    type="text"
+                                    id="taskName"
+                                    name="taskName"
+                                    value="${task.taskName}"
+                                    onchange="handleInputChange(event)"
+                                    required
+                                    class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                                    placeholder="예: 주간 보고서 작성"
+                                />
+                            </div>
+
+                            <div class="grid grid-cols-2 gap-4">
+                                <div class="space-y-2">
+                                    <label for="startDate" class="block text-sm font-medium text-gray-700">시작일</label>
+                                    <input
+                                        type="date"
+                                        id="startDate"
+                                        name="startDate"
+                                        value="${task.startDate}"
+                                        onchange="handleInputChange(event)"
+                                        required
+                                        class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                                    />
+                                </div>
+                                <div class="space-y-2">
+                                    <label for="startTime" class="block text-sm font-medium text-gray-700">시작 시간</label>
+                                    <input
+                                        type="time"
+                                        id="startTime"
+                                        name="startTime"
+                                        value="${task.startTime}"
+                                        onchange="handleInputChange(event)"
+                                        required
+                                        class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                                    />
+                                </div>
+                            </div>
+                            
+                            <div class="grid grid-cols-2 gap-4">
+                                <div class="space-y-2">
+                                    <label for="endDate" class="block text-sm font-medium text-gray-700">종료일</label>
+                                    <input
+                                        type="date"
+                                        id="endDate"
+                                        name="endDate"
+                                        value="${task.endDate}"
+                                        onchange="handleInputChange(event)"
+                                        required
+                                        class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                                    />
+                                </div>
+                                <div class="space-y-2">
+                                    <label for="endTime" class="block text-sm font-medium text-gray-700">종료 시간</label>
+                                    <input
+                                        type="time"
+                                        id="endTime"
+                                        name="endTime"
+                                        value="${task.endTime}"
+                                        onchange="handleInputChange(event)"
+                                        required
+                                        class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                                    />
+                                </div>
+                            </div>
+                            
+                            <div class="grid grid-cols-3 gap-4">
+                                <div class="space-y-2">
+                                    <label for="priority" class="block text-sm font-medium text-gray-700">우선순위</label>
+                                    <select
+                                        id="priority"
+                                        name="priority"
+                                        value="${task.priority}"
+                                        onchange="handleInputChange(event)"
+                                        class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                                    >
+                                        <option value="낮음" ${task.priority === '낮음' ? 'selected' : ''}>낮음</option>
+                                        <option value="중간" ${task.priority === '중간' ? 'selected' : ''}>중간</option>
+                                        <option value="높음" ${task.priority === '높음' ? 'selected' : ''}>높음</option>
+                                    </select>
+                                </div>
+                                <div class="space-y-2">
+                                    <label for="importance" class="block text-sm font-medium text-gray-700">중요도</label>
+                                    <select
+                                        id="importance"
+                                        name="importance"
+                                        value="${task.importance}"
+                                        onchange="handleInputChange(event)"
+                                        class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                                    >
+                                        <option value="낮음" ${task.importance === '낮음' ? 'selected' : ''}>낮음</option>
+                                        <option value="중간" ${task.importance === '중간' ? 'selected' : ''}>중간</option>
+                                        <option value="높음" ${task.importance === '높음' ? 'selected' : ''}>높음</option>
+                                    </select>
+                                </div>
+                                <!-- 업무 분류 (사용자 지정 분류 포함) -->
+                                <div class="space-y-2">
+                                    <label for="category" class="block text-sm font-medium text-gray-700">분류</label>
+                                    <select
+                                        id="category"
+                                        name="category"
+                                        value="${task.category}"
+                                        onchange="handleInputChange(event)"
+                                        class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
+                                    >
+                                        ${state.customCategories.map(opt => `<option value="${opt}" ${task.category === opt ? 'selected' : ''}>${opt}</option>`).join('')}
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            ${isEditing ? `
+                                <div class="flex items-center pt-2">
+                                    <input
+                                        id="completed"
+                                        name="completed"
+                                        type="checkbox"
+                                        ${task.completed ? 'checked' : ''}
+                                        onchange="handleInputChange(event)"
+                                        class="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+                                    />
+                                    <label for="completed" class="ml-2 block text-sm font-medium text-gray-700">
+                                        업무 완료 상태
+                                    </label>
+                                </div>
+                            ` : ''}
+
+                            <div class="pt-4">
+                                <button
+                                    type="submit"
+                                    class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150"
+                                >
+                                    ${isEditing ? '업무 수정 완료' : '업무 추가하기'}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- 메인 렌더링 함수 ---
+        function renderApp() {
+            if (!state.isAuthReady) {
+                appElement.innerHTML = `
+                    <div class="text-center py-12 text-lg text-indigo-500">
+                        <svg class="animate-spin inline-block w-6 h-6 mr-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        데이터 로딩 중...
+                    </div>
+                `;
+                return;
+            }
+
+            let mainContent = '';
+            if (state.activeTab === 'list') {
+                mainContent = renderTaskList();
+            } else if (state.activeTab === 'calendar') {
+                mainContent = renderCalendar();
+            } else if (state.activeTab === 'categories') {
+                mainContent = renderCategoryManager();
+            }
+
+            appElement.innerHTML = `
+                ${renderHeader()}
+                
+                <!-- 통계 -->
+                ${renderStats()}
+
+                <!-- 메인 뷰 탭 -->
+                <div class="flex border-b border-gray-200 mb-6">
+                    <button
+                        onclick="setActiveTab('list')"
+                        class="px-4 py-2 text-lg font-semibold flex items-center transition duration-200 ${
+                            state.activeTab === 'list' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-gray-500 hover:text-gray-700'
+                        }"
+                    >
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"></path></svg>
+                        업무 목록
+                    </button>
+                    <button
+                        onclick="setActiveTab('calendar')"
+                        class="px-4 py-2 text-lg font-semibold flex items-center transition duration-200 ${
+                            state.activeTab === 'calendar' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-gray-500 hover:text-gray-700'
+                        }"
+                    >
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-4 4V3m4 8H8m4-4h.01M12 21V11M3 8h18"></path></svg>
+                        캘린더 보기
+                    </button>
+                    <button
+                        onclick="setActiveTab('categories')"
+                        class="px-4 py-2 text-lg font-semibold flex items-center transition duration-200 ${
+                            state.activeTab === 'categories' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-gray-500 hover:text-gray-700'
+                        }"
+                    >
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37a1.724 1.724 0 002.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                        분류 관리
+                    </button>
+                </div>
+
+                <!-- 메인 콘텐츠 -->
+                ${mainContent}
+                
+                <!-- 모달 렌더링 -->
+                ${renderModal()}
+            `;
+        }
+        
+        // 애플리케이션 시작
+        initFirebase();
+    </script>
+</body>
+</html>
